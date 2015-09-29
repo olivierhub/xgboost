@@ -87,6 +87,7 @@ class XGBModel(XGBModelBase):
         self.seed = seed
         self.missing = missing if missing is not None else np.nan
         self._Booster = None
+        self.feature_importances_ = None
 
     def __setstate__(self, state):
         # backward compatiblity code
@@ -196,6 +197,14 @@ class XGBModel(XGBModelBase):
         if early_stopping_rounds is not None:
             self.best_score = self._Booster.best_score
             self.best_iteration = self._Booster.best_iteration
+        
+        importance = _Booster.get_fscore()
+        self.feature_importances_ = np.zeros(X.shape[1])
+        tuples = [(k, importance[k]) for k in importance]
+        for t in tuples:
+            f,i = int(t[0][1:]),t[1]
+            self.feature_importances_[f] = i
+                    
         return self
 
     def predict(self, data):
@@ -222,6 +231,7 @@ class XGBClassifier(XGBModel, XGBClassifierBase):
                                             max_delta_step, subsample,
                                             colsample_bytree,
                                             base_score, seed, missing)
+        self.feature_importances_ = None
 
     def fit(self, X, y, sample_weight=None, eval_set=None, eval_metric=None,
             early_stopping_rounds=None, verbose=True):
@@ -310,6 +320,13 @@ class XGBClassifier(XGBModel, XGBClassifierBase):
         if early_stopping_rounds is not None:
             self.best_score = self._Booster.best_score
             self.best_iteration = self._Booster.best_iteration
+
+        importance = self._Booster.get_fscore()
+        self.feature_importances_ = np.zeros(X.shape[1])
+        tuples = [(k, importance[k]) for k in importance]
+        for t in tuples:
+            f,i = int(t[0][1:]),t[1]
+            self.feature_importances_[f] = i
 
         return self
 
