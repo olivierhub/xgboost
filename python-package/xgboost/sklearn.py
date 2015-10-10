@@ -6,6 +6,10 @@ from __future__ import absolute_import
 import numpy as np
 from .core import Booster, DMatrix, XGBoostError
 from .training import train
+import sys
+import re
+import numpy as np
+from .core import STRING_TYPES
 
 try:
     from sklearn.base import BaseEstimator
@@ -233,7 +237,8 @@ class XGBClassifier(XGBModel, XGBClassifierBase):
                                             base_score, seed, missing)
         self.feature_importances_ = None
 
-    def fit(self, X, y, sample_weight=None, eval_set=None, eval_metric=None,
+    
+    def prepare_fit(self, X, y, sample_weight=None, eval_set=None, eval_metric=None,
             early_stopping_rounds=None, verbose=True):
         # pylint: disable = attribute-defined-outside-init,arguments-differ
         """
@@ -269,7 +274,10 @@ class XGBClassifier(XGBModel, XGBClassifierBase):
             If `verbose` and an evaluation set is used, writes the evaluation
             metric measured on the validation set to stderr.
         """
-        eval_results = {}
+        #if self.eval_results is None:
+        self.eval_results = {}
+        self.last_iteration = 0
+        
         self.classes_ = list(np.unique(y))
         self.n_classes_ = len(self.classes_)
         if self.n_classes_ > 2:
@@ -296,6 +304,86 @@ class XGBClassifier(XGBModel, XGBClassifierBase):
         else:
             evals = ()
 
+        self.evals = evals
+        self._le = LabelEncoder().fit(y)
+        training_labels = self._le.transform(y)
+
+        if sample_weight is not None:
+            self.train_dmatrix = DMatrix(X, label=training_labels, weight=sample_weight,
+                                    missing=self.missing)
+        else:
+            self.train_dmatrix = DMatrix(X, label=training_labels,
+                                    missing=self.missing)
+
+        return self
+
+
+    def fit_after_prepare(self, X, y, eval_metric=None,
+            early_stopping_rounds=None, verbose=True):
+        # pylint: disable = attribute-defined-outside-init,arguments-differ
+        """
+        Fit gradient boosting classifier
+
+        Parameters
+        ----------
+        X : array_like
+            Feature matrix
+        y : array_like
+            Labels
+        sample_weight : array_like
+            Weight for each instance
+        eval_set : list, optional
+            A list of (X, y) pairs to use as a validation set for
+            early-stopping
+        eval_metric : str, callable, optional
+            If a str, should be a built-in evaluation metric to use. See
+            doc/parameter.md. If callable, a custom evaluation metric. The call
+            signature is func(y_predicted, y_true) where y_true will be a
+            DMatrix object such that you may need to call the get_label
+            method. It must return a str, value pair where the str is a name
+            for the evaluation and value is the value of the evaluation
+            function. This objective is always minimized.
+        early_stopping_rounds : int, optional
+            Activates early stopping. Validation error needs to decrease at
+            least every <early_stopping_rounds> round(s) to continue training.
+            Requires at least one item in evals.  If there's more than one,
+            will use the last. Returns the model from the last iteration
+            (not the best one). If early stopping occurs, the model will
+            have two additional fields: bst.best_score and bst.best_iteration.
+        verbose : bool
+            If `verbose` and an evaluation set is used, writes the evaluation
+            metric measured on the validation set to stderr.
+        """
+        
+        
+        self.classes_ = list(np.unique(y))
+        self.n_classes_ = len(self.classes_)
+        
+        if self.n_classes_ > 2:
+            # Switch to using a multiclass objective in the underlying XGB instance
+            self.objective = "multi:softprob"
+            xgb_options = self.get_xgb_params()
+            xgb_options['num_class'] = self.n_classes_
+        else:
+            xgb_options = self.get_xgb_params()
+
+        feval = eval_metric if callable(eval_metric) else None
+        if eval_metric is not None:
+            if callable(eval_metric):
+                eval_metric = None
+            else:
+                xgb_options.update({"eval_metric": eval_metric})
+
+        """
+        if eval_set is not None:
+            # TODO: use sample_weight if given?
+            evals = list(DMatrix(x[0], label=x[1]) for x in eval_set)
+            nevals = len(evals)
+            eval_names = ["validation_{}".format(i) for i in range(nevals)]
+            evals = list(zip(evals, eval_names))
+        else:
+            evals = ()
+        
         self._le = LabelEncoder().fit(y)
         training_labels = self._le.transform(y)
 
@@ -304,19 +392,21 @@ class XGBClassifier(XGBModel, XGBClassifierBase):
                                     missing=self.missing)
         else:
             train_dmatrix = DMatrix(X, label=training_labels,
-                                    missing=self.missing)
-
-        self._Booster = train(xgb_options, train_dmatrix, self.n_estimators,
-                              evals=evals,
+                                 missing=self.missing)
+        """
+        
+        self._Booster = self.train_inc(xgb_options, self.train_dmatrix, self.n_estimators,
+                              evals=self.evals,
                               early_stopping_rounds=early_stopping_rounds,
-                              evals_result=eval_results, feval=feval,
+                              evals_result=self.eval_results, feval=feval,
                               verbose_eval=verbose)
 
+        """
         if eval_results:
             eval_results = {k: np.array(v, dtype=float)
                             for k, v in eval_results.items()}
             self.eval_results = eval_results
-
+        """
         if early_stopping_rounds is not None:
             self.best_score = self._Booster.best_score
             self.best_iteration = self._Booster.best_iteration
@@ -330,8 +420,242 @@ class XGBClassifier(XGBModel, XGBClassifierBase):
 
         return self
 
-    def predict(self, data):
+    
+    def train_inc(self,params, dtrain, num_boost_round=10, evals=(), obj=None, feval=None,
+              early_stopping_rounds=None, evals_result=None, verbose_eval=True):
+        # pylint: disable=too-many-statements,too-many-branches, attribute-defined-outside-init
+        """Train a booster with given parameters.
+    
+        Parameters
+        ----------
+        params : dict
+            Booster params.
+        dtrain : DMatrix
+            Data to be trained.
+        num_boost_round: int
+            Number of boosting iterations.
+        watchlist (evals): list of pairs (DMatrix, string)
+            List of items to be evaluated during training, this allows user to watch
+            performance on the validation set.
+        obj : function
+            Customized objective function.
+        feval : function
+            Customized evaluation function.
+        early_stopping_rounds: int
+            Activates early stopping. Validation error needs to decrease at least
+            every <early_stopping_rounds> round(s) to continue training.
+            Requires at least one item in evals.
+            If there's more than one, will use the last.
+            Returns the model from the last iteration (not the best one).
+            If early stopping occurs, the model will have two additional fields:
+            bst.best_score and bst.best_iteration.
+        evals_result: dict
+            This dictionary stores the evaluation results of all the items in watchlist
+        verbose_eval : bool
+            If `verbose_eval` then the evaluation metric on the validation set, if
+            given, is printed at each boosting stage.
+    
+        Returns
+        -------
+        booster : a trained booster model
+        """
+        evals = list(evals)
+        
+        if self._Booster is None:
+            self._Booster = Booster(params, [dtrain] + [d[0] for d in evals])
+    
+        if evals_result is not None:
+            if not isinstance(evals_result, dict):
+                raise TypeError('evals_result has to be a dictionary')
+            else:
+                evals_name = [d[1] for d in evals]
+                evals_result.clear()
+                evals_result.update({key: [] for key in evals_name})
+    
+        if not early_stopping_rounds:
+            for i in range(num_boost_round):
+                self._Booster.update(dtrain, self.last_iteration, obj)
+                if len(evals) != 0:
+                    bst_eval_set = self._Booster.eval_set(evals, self.last_iteration, feval)
+                    if isinstance(bst_eval_set, STRING_TYPES):
+                        msg = bst_eval_set
+                    else:
+                        msg = bst_eval_set.decode()
+    
+                    if verbose_eval:
+                        sys.stderr.write(msg + '\n')
+                    if evals_result is not None:
+                        res = re.findall(":-?([0-9.]+).", msg)
+                        for key, val in zip(evals_name, res):
+                            evals_result[key].append(val)
+                self.last_iteration += 1
+            return self._Booster
+    
+        else:
+            # early stopping
+            if len(evals) < 1:
+                raise ValueError('For early stopping you need at least one set in evals.')
+    
+            sys.stderr.write("Will train until {} error hasn't decreased in {} rounds.\n".format(\
+                    evals[-1][1], early_stopping_rounds))
+    
+            # is params a list of tuples? are we using multiple eval metrics?
+            if isinstance(params, list):
+                if len(params) != len(dict(params).items()):
+                    raise ValueError('Check your params.'\
+                                         'Early stopping works with single eval metric only.')
+                params = dict(params)
+    
+            # either minimize loss or maximize AUC/MAP/NDCG
+            maximize_score = False
+            if 'eval_metric' in params:
+                maximize_metrics = ('auc', 'map', 'ndcg')
+                if any(params['eval_metric'].startswith(x) for x in maximize_metrics):
+                    maximize_score = True
+    
+            if maximize_score:
+                best_score = 0.0
+            else:
+                best_score = float('inf')
+    
+            best_msg = ''
+            best_score_i = 0
+    
+            for i in range(num_boost_round):
+                self._Booster.update(dtrain, self.last_iteration, obj)
+                bst_eval_set = self._Booster.eval_set(evals, self.last_iteration, feval)            
+                
+                if isinstance(bst_eval_set, STRING_TYPES):
+                    msg = bst_eval_set
+                else:
+                    msg = bst_eval_set.decode()
+    
+                if verbose_eval:
+                    sys.stderr.write(msg + '\n')
+    
+                if evals_result is not None:
+                    res = re.findall(":-?([0-9.]+).", msg)
+                    for key, val in zip(evals_name, res):
+                        evals_result[key].append(val)
+    
+                score = float(msg.rsplit(':', 1)[1])
+                if (maximize_score and score > best_score) or \
+                        (not maximize_score and score < best_score):
+                    best_score = score
+                    best_score_i = i
+                    best_msg = msg
+                elif i - best_score_i >= early_stopping_rounds:
+                    sys.stderr.write("Stopping. Best iteration:\n{}\n\n".format(best_msg))
+                    self._Booster.best_score = best_score
+                    self._Booster.best_iteration = best_score_i
+                    break
+                self.last_iteration += 1
+            self._Booster.best_score = best_score
+            self._Booster.best_iteration = best_score_i
+            return self._Booster
+    
+    
+        def fit(self, X, y, sample_weight=None, eval_set=None, eval_metric=None,
+                early_stopping_rounds=None, verbose=True):
+            # pylint: disable = attribute-defined-outside-init,arguments-differ
+            """
+            Fit gradient boosting classifier
+    
+            Parameters
+            ----------
+            X : array_like
+                Feature matrix
+            y : array_like
+                Labels
+            sample_weight : array_like
+                Weight for each instance
+            eval_set : list, optional
+                A list of (X, y) pairs to use as a validation set for
+                early-stopping
+            eval_metric : str, callable, optional
+                If a str, should be a built-in evaluation metric to use. See
+                doc/parameter.md. If callable, a custom evaluation metric. The call
+                signature is func(y_predicted, y_true) where y_true will be a
+                DMatrix object such that you may need to call the get_label
+                method. It must return a str, value pair where the str is a name
+                for the evaluation and value is the value of the evaluation
+                function. This objective is always minimized.
+            early_stopping_rounds : int, optional
+                Activates early stopping. Validation error needs to decrease at
+                least every <early_stopping_rounds> round(s) to continue training.
+                Requires at least one item in evals.  If there's more than one,
+                will use the last. Returns the model from the last iteration
+                (not the best one). If early stopping occurs, the model will
+                have two additional fields: bst.best_score and bst.best_iteration.
+            verbose : bool
+                If `verbose` and an evaluation set is used, writes the evaluation
+                metric measured on the validation set to stderr.
+            """
+            eval_results = {}
+            self.classes_ = list(np.unique(y))
+            self.n_classes_ = len(self.classes_)
+            if self.n_classes_ > 2:
+                # Switch to using a multiclass objective in the underlying XGB instance
+                self.objective = "multi:softprob"
+                xgb_options = self.get_xgb_params()
+                xgb_options['num_class'] = self.n_classes_
+            else:
+                xgb_options = self.get_xgb_params()
+    
+            feval = eval_metric if callable(eval_metric) else None
+            if eval_metric is not None:
+                if callable(eval_metric):
+                    eval_metric = None
+                else:
+                    xgb_options.update({"eval_metric": eval_metric})
+    
+            if eval_set is not None:
+                # TODO: use sample_weight if given?
+                evals = list(DMatrix(x[0], label=x[1]) for x in eval_set)
+                nevals = len(evals)
+                eval_names = ["validation_{}".format(i) for i in range(nevals)]
+                evals = list(zip(evals, eval_names))
+            else:
+                evals = ()
+    
+            self._le = LabelEncoder().fit(y)
+            training_labels = self._le.transform(y)
+    
+            if sample_weight is not None:
+                train_dmatrix = DMatrix(X, label=training_labels, weight=sample_weight,
+                                        missing=self.missing)
+            else:
+                train_dmatrix = DMatrix(X, label=training_labels,
+                                        missing=self.missing)
+    
+            self._Booster = train(xgb_options, train_dmatrix, self.n_estimators,
+                                  evals=evals,
+                                  early_stopping_rounds=early_stopping_rounds,
+                                  evals_result=eval_results, feval=feval,
+                                  verbose_eval=verbose)
+    
+            if eval_results:
+                eval_results = {k: np.array(v, dtype=float)
+                                for k, v in eval_results.items()}
+                self.eval_results = eval_results
+    
+            if early_stopping_rounds is not None:
+                self.best_score = self._Booster.best_score
+                self.best_iteration = self._Booster.best_iteration
+    
+            importance = self._Booster.get_fscore()
+            self.feature_importances_ = np.zeros(X.shape[1])
+            tuples = [(k, importance[k]) for k in importance]
+            for t in tuples:
+                f,i = int(t[0][1:]),t[1]
+                self.feature_importances_[f] = i
+    
+            return self
+
+    def predict(self, data, margin = None):
         test_dmatrix = DMatrix(data, missing=self.missing)
+        if margin is not None:
+            test_dmatrix.set_base_margin(margin)        
         class_probs = self.booster().predict(test_dmatrix)
         if len(class_probs.shape) > 1:
             column_indexes = np.argmax(class_probs, axis=1)
@@ -340,8 +664,10 @@ class XGBClassifier(XGBModel, XGBClassifierBase):
             column_indexes[class_probs > 0.5] = 1
         return self._le.inverse_transform(column_indexes)
 
-    def predict_proba(self, data):
+    def predict_proba(self, data, margin = None):
         test_dmatrix = DMatrix(data, missing=self.missing)
+        if margin is not None:
+            test_dmatrix.set_base_margin(margin)
         class_probs = self.booster().predict(test_dmatrix)
         if self.objective == "multi:softprob":
             return class_probs
